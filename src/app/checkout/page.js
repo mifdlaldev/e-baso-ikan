@@ -1,442 +1,566 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
-import { useCart } from '../../context/CartContext';
-import { useRouter } from 'next/navigation';
-import {
-    ChevronLeft,
-    ChevronRight,
-    ShoppingCart,
-    ShoppingBag,
-    MessageSquare,
-    CreditCard,
-    Wallet,
-    Banknote,
-    QrCode,
-    Info,
-    ShieldCheck,
-    Clock,
-    CheckCircle2,
-    Package,
-    User
-} from 'lucide-react';
+import Image from 'next/image';
+import Script from 'next/script';
+import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
+import { CheckCircle2, CreditCard, MapPin, ReceiptText } from 'lucide-react';
+import { useCart } from '../../context/CartContext';
+import { useAuth } from '../../context/AuthContext';
+import { formatCurrency } from '../../lib/formatters';
+import { getMidtransEnv, getMidtransSnapScriptUrl, hasMidtransClientEnv } from '../../lib/midtrans/env';
+import { useHydrated } from '../../hooks/useHydrated';
+import SiteFooter from '../../components/SiteFooter';
+import SiteHeader from '../../components/SiteHeader';
+
+const paymentOptions = [
+    { key: 'tunai', title: 'Tunai Saat Ambil', note: 'Bayar di kasir ketika pesanan ready.' },
+    { key: 'midtrans', title: 'Via Midtrans', note: 'QRIS, e-wallet, VA, dan kartu dalam satu popup.' }
+];
+
+const deliveryOptions = [
+    { key: 'pickup', title: 'Ambil di Kantin', note: 'Pilihan tercepat untuk menu yang baru matang.' },
+    { key: 'delivery', title: 'Antar ke Kelas', note: 'Isi lokasi kelas atau ruangan dengan jelas.' }
+];
 
 export default function CheckoutPage() {
-    const { cartItems: contextCartItems, cartCount: contextCartCount, checkout, clearCart } = useCart();
-    // Safety check as requested
-    const cartItems = contextCartItems || [];
-    const cartCount = contextCartCount || 0;
-
-    const router = useRouter();
-    const [isProcessing, setIsProcessing] = useState(false);
-    const [isSuccess, setIsSuccess] = useState(false);
+    const { cartItems, checkout, clearCart } = useCart();
+    const { user, profile, isAuthenticated, loading } = useAuth();
+    const isHydrated = useHydrated();
+    const [customerName, setCustomerName] = useState('');
     const [orderNote, setOrderNote] = useState('');
-    const [paymentMethod, setPaymentMethod] = useState('saldo');
+    const [paymentMethod, setPaymentMethod] = useState('tunai');
     const [deliveryMethod, setDeliveryMethod] = useState('pickup');
-    const [classRoom, setClassRoom] = useState('');
-    const [classError, setClassError] = useState(false);
-    const [namaPembeli, setNamaPembeli] = useState('');
+    const [destination, setDestination] = useState('');
+    const [isSuccess, setIsSuccess] = useState(false);
+    const [successCopy, setSuccessCopy] = useState({
+        title: 'Pesananmu masuk ke dapur.',
+        description: 'Tim e-baso-ikan sedang menyiapkan pesananmu. Kamu bisa lanjut ke halaman pesanan untuk melihat status terbaru.'
+    });
+    const [checkoutError, setCheckoutError] = useState('');
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [pendingMidtransPayment, setPendingMidtransPayment] = useState(null);
 
-    const subtotal = cartItems.reduce((total, item) => total + (item.price * item.quantity), 0);
-    const serviceFee = 1000;
-    const tax = 0;
-    const total = subtotal + serviceFee + tax;
+    const subtotal = useMemo(
+        () => cartItems.reduce((total, item) => total + (item.price * item.quantity), 0),
+        [cartItems]
+    );
+    const serviceFee = cartItems.length > 0 ? 2000 : 0;
+    const total = subtotal + serviceFee;
+    const midtransEnabled = hasMidtransClientEnv();
+    const { clientKey: midtransClientKey } = getMidtransEnv();
 
     useEffect(() => {
-        if (cartCount === 0 && !isSuccess) {
-            // Handle empty cart
+        if (profile?.full_name && !customerName.trim()) {
+            setCustomerName(profile.full_name);
         }
-    }, [cartCount, isSuccess]);
+    }, [customerName, profile?.full_name]);
 
-    const handleConfirmPayment = () => {
-        if (deliveryMethod === 'delivery' && !classRoom.trim()) {
-            setClassError(true);
-            const input = document.getElementById('classRoomInput');
-            if (input) input.focus();
+    if (!isHydrated) {
+        return (
+            <div className="pb-8 pt-4">
+                <SiteHeader />
+                <main className="shell mt-6">
+                    <section className="section-card rounded-[40px] p-10 text-center">
+                        <h1 className="font-display text-5xl text-[#1f2333]">Menyiapkan checkout...</h1>
+                        <p className="mx-auto mt-4 max-w-lg text-sm leading-7 text-[#5b6170]">
+                            Ringkasan pesanan sedang disinkronkan dari perangkatmu supaya total dan metode pembayaran tampil akurat.
+                        </p>
+                    </section>
+                </main>
+                <SiteFooter />
+            </div>
+        );
+    }
+
+    const syncMidtransOrder = async (orderId) => {
+        if (!orderId) return null;
+
+        const response = await fetch('/api/payments/midtrans/sync', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ orderId })
+        });
+        const result = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            throw new Error(result?.error || 'Gagal sinkronisasi status Midtrans ke server.');
+        }
+
+        return result;
+    };
+
+    const launchMidtransPopup = (snapToken, orderId) => {
+        if (typeof window === 'undefined' || !window.snap) {
+            throw new Error('Popup Midtrans belum siap dimuat. Coba tunggu sebentar lalu klik lagi.');
+        }
+
+        const successRedirectUrl = `/checkout/success?order_id=${encodeURIComponent(orderId)}`;
+
+        window.snap.pay(snapToken, {
+            onSuccess: async () => {
+                try {
+                    const syncResult = await syncMidtransOrder(orderId);
+                    const transactionStatus = syncResult?.transaction?.status || 'settlement';
+                    clearCart();
+                    setPendingMidtransPayment(null);
+                    window.location.href = `${successRedirectUrl}&transaction_status=${encodeURIComponent(transactionStatus)}`;
+                    return;
+                } catch (error) {
+                    console.warn('Failed to sync paid Midtrans order:', error);
+                }
+
+                clearCart();
+                setPendingMidtransPayment(null);
+                setSuccessCopy({
+                    title: 'Pembayaran Midtrans berhasil.',
+                    description: 'Pembayaranmu sudah tercatat dan pesanan langsung masuk ke sistem e-baso-ikan. Kamu bisa cek statusnya di halaman pesanan.'
+                });
+                setCheckoutError('');
+                setIsSuccess(true);
+            },
+            onPending: async () => {
+                try {
+                    const syncResult = await syncMidtransOrder(orderId);
+                    const transactionStatus = syncResult?.transaction?.status || 'pending';
+                    clearCart();
+                    setPendingMidtransPayment(null);
+                    window.location.href = `${successRedirectUrl}&transaction_status=${encodeURIComponent(transactionStatus)}`;
+                    return;
+                } catch (error) {
+                    console.warn('Failed to sync pending Midtrans order:', error);
+                }
+
+                clearCart();
+                setPendingMidtransPayment(null);
+                setSuccessCopy({
+                    title: 'Pembayaran Midtrans menunggu diselesaikan.',
+                    description: 'Instruksi pembayaran sudah muncul dari Midtrans. Pesananmu sudah tercatat dan bisa dilanjutkan sesuai metode yang kamu pilih.'
+                });
+                setCheckoutError('');
+                setIsSuccess(true);
+            },
+            onError: (result) => {
+                console.warn('Midtrans popup error:', result);
+                setCheckoutError('Midtrans gagal memproses pembayaran. Coba buka lagi popup-nya atau pilih metode lain.');
+            },
+            onClose: () => {
+                setCheckoutError('Popup Midtrans ditutup sebelum pembayaran selesai. Klik tombol lagi untuk melanjutkan pembayaran yang sama.');
+            }
+        });
+    };
+
+    const handleSubmit = async () => {
+        if (isSubmitting) return;
+
+        if (!customerName.trim()) {
+            alert('Masukkan nama pemesan dulu sebelum checkout.');
             return;
         }
 
-        setIsProcessing(true);
-        setTimeout(() => {
-            const orderId = checkout({
+        if (deliveryMethod === 'delivery' && !destination.trim()) {
+            alert('Isi lokasi kelas atau ruangan untuk pengantaran.');
+            return;
+        }
+
+        setIsSubmitting(true);
+        setCheckoutError('');
+
+        try {
+            const checkoutPayload = {
                 note: orderNote,
                 paymentMethod,
                 deliveryMethod,
-                classRoom: deliveryMethod === 'delivery' ? classRoom : null,
-                nama_pembeli: namaPembeli
-            });
-            setIsProcessing(false);
-            if (orderId) {
+                classRoom: deliveryMethod === 'delivery' ? destination : 'Ambil di kantin',
+                nama_pembeli: customerName
+            };
+
+            if (paymentMethod !== 'midtrans') {
+                await checkout(checkoutPayload);
+                setSuccessCopy({
+                    title: 'Pesananmu masuk ke dapur.',
+                    description: 'Tim e-baso-ikan sedang menyiapkan pesananmu. Kamu bisa lanjut ke halaman pesanan untuk melihat status terbaru.'
+                });
                 setIsSuccess(true);
-                setTimeout(() => {
-                    router.push('/orders');
-                }, 2000);
+                return;
             }
-        }, 1500);
+
+            if (!midtransEnabled) {
+                throw new Error('Midtrans belum dikonfigurasi di environment. Isi client key dan server key terlebih dulu.');
+            }
+
+            if (pendingMidtransPayment?.token) {
+                launchMidtransPopup(pendingMidtransPayment.token, pendingMidtransPayment.orderId);
+                return;
+            }
+
+            const orderResult = await checkout(checkoutPayload, { clearCart: false });
+
+            if (!orderResult?.orderId) {
+                throw new Error('Pesanan belum berhasil dibuat, jadi token Midtrans belum bisa dibuka.');
+            }
+
+            if (!orderResult.supabaseOrderId) {
+                throw new Error('Order Midtrans belum tersimpan ke Supabase. Jalankan migration Midtrans terbaru lalu coba lagi.');
+            }
+
+            const response = await fetch('/api/payments/midtrans/snap-token', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    orderId: orderResult.orderId,
+                    total: orderResult.total,
+                    serviceFee,
+                    items: cartItems,
+                    customerName,
+                    customerEmail: user?.email || '',
+                    customerPhone: profile?.phone || '',
+                    deliveryMethod,
+                    destination: deliveryMethod === 'delivery' ? destination : 'Ambil di kantin',
+                    orderNote
+                })
+            });
+            const result = await response.json().catch(() => ({}));
+
+            if (!response.ok || !result?.token) {
+                throw new Error(result?.error || 'Gagal membuat token pembayaran Midtrans.');
+            }
+
+            setPendingMidtransPayment({
+                token: result.token,
+                orderId: orderResult.orderId
+            });
+            launchMidtransPopup(result.token, orderResult.orderId);
+        } catch (error) {
+            setCheckoutError(error.message || 'Checkout gagal diproses.');
+        } finally {
+            setIsSubmitting(false);
+        }
     };
 
-    const formatPrice = (price) => {
-        return new Intl.NumberFormat('id-ID').format(price);
-    };
-
-    if (cartCount === 0 && !isSuccess) {
+    if (cartItems.length === 0 && !isSuccess) {
         return (
-            <div className="min-h-screen bg-white flex flex-col items-center justify-center p-8">
-                <div className="w-24 h-24 bg-blue-50 rounded-full flex items-center justify-center mb-6">
-                    <ShoppingBag size={48} className="text-blue-400" />
-                </div>
-                <h1 className="text-2xl font-black text-gray-900 mb-2 tracking-tight">Belum Ada Pesanan</h1>
-                <p className="text-gray-500 mb-8 text-center max-w-xs font-medium">Selesaikan pesanan baso favoritmu di kantin sekolah dengan memilih menu terlebih dahulu.</p>
-                <Link href="/home" className="bg-blue-600 text-white font-bold px-10 py-4 rounded-2xl shadow-xl shadow-blue-600/30 hover:bg-blue-700 transition-all hover:-translate-y-1 active:scale-95">
-                    Kembali ke Menu
-                </Link>
+            <div className="pb-8 pt-4">
+                <SiteHeader />
+                <main className="shell mt-6">
+                    <section className="section-card rounded-[40px] p-10 text-center">
+                        <h1 className="font-display text-5xl text-[#1f2333]">Checkout belum bisa dimulai.</h1>
+                        <p className="mx-auto mt-4 max-w-lg text-sm leading-7 text-[#5b6170]">
+                            Keranjangmu masih kosong, jadi belum ada yang bisa dibayar. Kembali ke menu dulu, lalu pilih baso ikan favoritmu.
+                        </p>
+                        <Link href="/#menu" className="mt-8 inline-flex rounded-full bg-[#1f2333] px-6 py-3 text-sm font-semibold text-white">
+                            Pilih Menu
+                        </Link>
+                    </section>
+                </main>
+                <SiteFooter />
+            </div>
+        );
+    }
+
+    if (!loading && !isAuthenticated) {
+        return (
+            <div className="pb-8 pt-4">
+                <SiteHeader />
+
+                <main className="shell mt-6 space-y-6">
+                    <section className="section-card rounded-[40px] px-6 py-8 sm:px-10">
+                        <div className="flex flex-col gap-4 border-b border-[rgba(31,35,51,0.08)] pb-6 lg:flex-row lg:items-end lg:justify-between">
+                            <div>
+                                <p className="mb-3 text-xs font-bold uppercase tracking-[0.28em] text-[#6b6f7b]">Checkout</p>
+                                <h1 className="font-display text-4xl text-[#1f2333] sm:text-5xl">Login dulu sebelum lanjut pembayaran.</h1>
+                            </div>
+                            <p className="max-w-xl text-sm leading-7 text-[#5b6170]">
+                                Untuk menjaga data pesanan, riwayat, dan pembayaran Midtrans tetap terhubung ke akun yang benar, checkout sekarang hanya bisa dilanjutkan setelah masuk atau daftar akun.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section className="grid gap-6 xl:grid-cols-[0.95fr_1.05fr]">
+                        <div className="section-card rounded-[34px] p-6 sm:p-8">
+                            <p className="text-xs font-bold uppercase tracking-[0.28em] text-[#6b6f7b]">Akses dibutuhkan</p>
+                            <h2 className="font-display mt-3 text-4xl text-[#1f2333]">Masuk atau buat akun dulu.</h2>
+                            <p className="mt-4 text-sm leading-7 text-[#5b6170]">
+                                Setelah login, kamu akan dikembalikan lagi ke checkout supaya bisa langsung pilih metode bayar dan menyelesaikan order.
+                            </p>
+
+                            <div className="mt-8 flex flex-wrap gap-3">
+                                <Link href="/auth?next=/checkout" className="inline-flex rounded-full bg-[#1f2333] px-6 py-3 text-sm font-semibold text-white">
+                                    Masuk / Daftar Dulu
+                                </Link>
+                                <Link href="/cart" className="inline-flex rounded-full border border-[rgba(31,35,51,0.08)] bg-white px-6 py-3 text-sm font-semibold text-[#1f2333]">
+                                    Kembali ke Keranjang
+                                </Link>
+                            </div>
+                        </div>
+
+                        <aside className="section-card rounded-[34px] p-6 sm:p-8">
+                            <p className="text-xs font-bold uppercase tracking-[0.28em] text-[#6b6f7b]">Ringkasan belanja</p>
+                            <h2 className="font-display mt-2 text-4xl text-[#1f2333]">Pesananmu siap dibayar.</h2>
+
+                            <div className="mt-8 space-y-4">
+                                {cartItems.map((item, index) => (
+                                    <div key={`${item.id}-${index}`} className="flex items-center gap-4 rounded-[24px] bg-[#fffaf2] p-4">
+                                        <div className="relative h-16 w-16 overflow-hidden rounded-2xl">
+                                            <Image
+                                                src={item.image}
+                                                alt={item.name}
+                                                fill
+                                                sizes="64px"
+                                                className="object-cover"
+                                            />
+                                        </div>
+                                        <div className="flex-1">
+                                            <p className="font-semibold text-[#1f2333]">{item.name}</p>
+                                            <p className="text-xs uppercase tracking-[0.22em] text-[#6b6f7b]">{item.quantity} porsi</p>
+                                        </div>
+                                        <p className="font-semibold text-[#1f2333]">Rp {formatCurrency(item.price * item.quantity)}</p>
+                                    </div>
+                                ))}
+                            </div>
+
+                            <div className="mt-8 space-y-4 border-t border-[rgba(31,35,51,0.08)] pt-6 text-sm">
+                                <div className="flex items-center justify-between text-[#5b6170]">
+                                    <span>Subtotal</span>
+                                    <span className="font-semibold text-[#1f2333]">Rp {formatCurrency(subtotal)}</span>
+                                </div>
+                                <div className="flex items-center justify-between text-[#5b6170]">
+                                    <span>Biaya layanan</span>
+                                    <span className="font-semibold text-[#1f2333]">Rp {formatCurrency(serviceFee)}</span>
+                                </div>
+                                <div className="flex items-center justify-between border-t border-[rgba(31,35,51,0.08)] pt-4">
+                                    <span className="font-semibold text-[#1f2333]">Total bayar</span>
+                                    <span className="font-display text-4xl text-[#d66b43]">Rp {formatCurrency(total)}</span>
+                                </div>
+                            </div>
+                        </aside>
+                    </section>
+                </main>
+
+                <SiteFooter />
             </div>
         );
     }
 
     if (isSuccess) {
         return (
-            <div className="min-h-screen bg-white flex flex-col items-center justify-center p-8">
-                <div className="w-24 h-24 bg-green-50 rounded-full flex items-center justify-center mb-8 animate-bounce">
-                    <CheckCircle2 size={48} className="text-green-500" />
-                </div>
-                <h1 className="text-3xl font-black text-gray-900 mb-3 tracking-tight">Pembayaran Berhasil!</h1>
-                <p className="text-gray-500 text-center max-w-sm mb-8 font-medium">Pesananmu sedang diproses oleh tim E-Baso. Kamu akan segera diarahkan ke halaman pesanan.</p>
-                <div className="w-48 h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                    <div className="h-full bg-green-500 animate-[loading_2s_linear]"></div>
-                </div>
-                <style jsx>{` @keyframes loading { from { width: 0%; } to { width: 100%; } } `}</style>
+            <div className="pb-8 pt-4">
+                {midtransEnabled && midtransClientKey ? (
+                    <Script
+                        id="midtrans-snap"
+                        src={getMidtransSnapScriptUrl()}
+                        data-client-key={midtransClientKey}
+                        strategy="afterInteractive"
+                    />
+                ) : null}
+                <SiteHeader />
+                <main className="shell mt-6">
+                    <section className="section-card rounded-[40px] p-10 text-center">
+                        <div className="mx-auto flex h-24 w-24 items-center justify-center rounded-full bg-[#eef5f2] text-[#1f5c57]">
+                            <CheckCircle2 size={44} />
+                        </div>
+                        <h1 className="font-display mt-6 text-5xl text-[#1f2333]">{successCopy.title}</h1>
+                        <p className="mx-auto mt-4 max-w-xl text-sm leading-7 text-[#5b6170]">
+                            {successCopy.description}
+                        </p>
+                        <Link href="/pesanan-saya" className="mt-8 inline-flex rounded-full bg-[#d66b43] px-6 py-3 text-sm font-semibold text-white">
+                            Lihat Pesanan Saya
+                        </Link>
+                    </section>
+                </main>
+                <SiteFooter />
             </div>
         );
     }
 
     return (
-        <div className="min-h-screen bg-[#FDFDFF] font-sans text-gray-900 pb-20">
-            {/* Header / Navbar Ref */}
-            <nav className="h-20 bg-white border-b border-gray-100/50 sticky top-0 z-50 flex items-center px-10 justify-between">
-                <Link href="/home" className="flex items-center gap-3">
-                    <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center">
-                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <path d="M12 2L4 9V21H20V9L12 2Z" fill="white" />
-                        </svg>
-                    </div>
-                    <span className="font-black text-xl text-blue-900 tracking-tight">E-Baso <span className="text-blue-500">Kantin</span></span>
-                </Link>
-                <div className="flex items-center gap-8 text-sm font-bold text-gray-500">
-                    <Link href="/home" className="hover:text-blue-600 transition-colors">Menu</Link>
-                    <Link href="/orders" className="hover:text-blue-600 transition-colors">Pesanan Saya</Link>
-                    <Link href="/history" className="hover:text-blue-600 transition-colors text-blue-600">Riwayat</Link>
-                    <div className="flex items-center gap-4 ml-4">
-                        <div className="p-2 bg-gray-50 rounded-full text-gray-400">
-                            <ShoppingCart size={20} />
+        <div className="pb-8 pt-4">
+            {midtransEnabled && midtransClientKey ? (
+                <Script
+                    id="midtrans-snap"
+                    src={getMidtransSnapScriptUrl()}
+                    data-client-key={midtransClientKey}
+                    strategy="afterInteractive"
+                />
+            ) : null}
+            <SiteHeader />
+
+            <main className="shell mt-6 space-y-6">
+                <section className="section-card rounded-[40px] px-6 py-8 sm:px-10">
+                    <div className="flex flex-col gap-4 border-b border-[rgba(31,35,51,0.08)] pb-6 lg:flex-row lg:items-end lg:justify-between">
+                        <div>
+                            <p className="mb-3 text-xs font-bold uppercase tracking-[0.28em] text-[#6b6f7b]">Checkout</p>
+                            <h1 className="font-display text-4xl text-[#1f2333] sm:text-5xl">Tahap akhir sebelum pesanan diproses.</h1>
                         </div>
-                        <div className="w-10 h-10 rounded-full bg-orange-200 border-2 border-white shadow-sm overflow-hidden p-1">
-                            <div className="bg-orange-300 w-full h-full rounded-full flex items-center justify-center text-[10px] font-black text-white">JD</div>
-                        </div>
+                        <p className="max-w-xl text-sm leading-7 text-[#5b6170]">
+                            Isi data pemesan, tentukan metode ambil, dan pilih pembayaran. Semua tetap dibuat singkat agar alur pesan makanan terasa cepat.
+                        </p>
                     </div>
-                </div>
-            </nav>
+                </section>
 
-            {/* Breadcrumbs */}
-            <div className="max-w-7xl mx-auto px-10 py-6">
-                <div className="flex items-center gap-3 text-xs font-bold text-gray-400 uppercase tracking-widest mb-6">
-                    <Link href="/home" className="hover:text-blue-600 transition-colors">Beranda</Link>
-                    <ChevronRight size={12} />
-                    <Link href="/cart" className="hover:text-blue-600 transition-colors">Keranjang</Link>
-                    <ChevronRight size={12} />
-                    <span className="text-blue-600">Pembayaran</span>
-                </div>
-
-                <div className="mb-12">
-                    <h1 className="text-4xl font-black text-gray-900 mb-2 tracking-tight">Konfirmasi Pembayaran</h1>
-                    <p className="text-gray-500 font-medium text-lg">Selesaikan pesanan baso favoritmu di kantin sekolah.</p>
-                </div>
-
-                <div className="flex flex-col lg:flex-row gap-10">
-                    {/* Left Section */}
-                    <div className="flex-1 space-y-10">
-
-                        {/* Detail Pesanan Card */}
-                        <section className="bg-white rounded-[2rem] border border-gray-100 shadow-[0_10px_30px_-15px_rgba(0,0,0,0.05)] overflow-hidden">
-                            <div className="p-8 border-b border-gray-50/50 flex items-center justify-between bg-white">
-                                <h3 className="text-xl font-black text-gray-900 flex items-center gap-4">
-                                    <div className="p-2 bg-blue-50 text-blue-600 rounded-lg">
-                                        <ShoppingBag size={22} />
-                                    </div>
-                                    Detail Pesanan
-                                </h3>
-                                <div className="px-4 py-1.5 bg-blue-50 text-blue-600 text-[10px] font-black rounded-full uppercase tracking-widest">
-                                    {cartCount} Item
+                <section className="grid gap-6 xl:grid-cols-[1.08fr_0.92fr]">
+                    <div className="space-y-6">
+                        <div className="section-card rounded-[34px] p-6 sm:p-8">
+                            <div className="mb-6 flex items-center gap-3">
+                                <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#f3ebdf] text-[#d66b43]">
+                                    <ReceiptText size={20} />
+                                </div>
+                                <div>
+                                    <p className="text-xs font-bold uppercase tracking-[0.28em] text-[#6b6f7b]">Identitas pesanan</p>
+                                    <h2 className="font-display text-3xl text-[#1f2333]">Siapa yang memesan?</h2>
                                 </div>
                             </div>
-                            <div className="p-0">
-                                <table className="w-full text-left">
-                                    <thead className="bg-[#FAFBFE] text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] border-b border-gray-50">
-                                        <tr>
-                                            <th className="px-10 py-5">Menu</th>
-                                            <th className="px-10 py-5 text-center">Jumlah</th>
-                                            <th className="px-10 py-5 text-right">Harga</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-gray-50/50">
-                                        {cartItems && cartItems.length > 0 && cartItems.map((item, idx) => (
-                                            <tr key={idx} className="hover:bg-blue-50/20 transition-colors">
-                                                <td className="px-10 py-8">
-                                                    <div className="flex items-center gap-6">
-                                                        <div className="w-20 h-20 bg-gray-50 rounded-2xl overflow-hidden border border-gray-100 shadow-sm shrink-0">
-                                                            <img src={item.image} alt={item.name} className="w-full h-full object-cover" />
-                                                        </div>
-                                                        <div>
-                                                            <p className="font-bold text-gray-900 text-lg mb-1">{item.name}</p>
-                                                            <p className="text-xs text-gray-400 font-medium">Level Pedas: 3</p>
-                                                        </div>
-                                                    </div>
-                                                </td>
-                                                <td className="px-10 py-8 text-center">
-                                                    <span className="font-bold text-gray-600 text-lg">{item.quantity}</span>
-                                                </td>
-                                                <td className="px-10 py-8 text-right">
-                                                    <span className="font-black text-blue-600 text-xl tracking-tight">Rp {formatPrice(item.price * item.quantity)}</span>
-                                                </td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </section>
 
-                        {/* Delivery Method Card */}
-                        <section className="bg-white rounded-[2rem] border border-gray-100 shadow-[0_10px_30px_-15px_rgba(0,0,0,0.05)] overflow-hidden">
-                            <div className="p-8">
-                                <h3 className="text-xl font-black text-gray-900 flex items-center gap-4 mb-8">
-                                    <div className="p-2 bg-blue-50 text-blue-600 rounded-lg">
-                                        <Info size={22} />
-                                    </div>
-                                    Metode Penerimaan
-                                </h3>
-
-                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
-                                    <div
-                                        onClick={() => { setDeliveryMethod('pickup'); setClassError(false); }}
-                                        className={`p-6 rounded-[1.5rem] border-2 transition-all cursor-pointer flex items-center gap-5 ${deliveryMethod === 'pickup' ? 'border-blue-600 bg-blue-50/10' : 'border-gray-100 hover:border-blue-200 bg-white'}`}
-                                    >
-                                        <div className={`w-12 h-12 rounded-xl flex items-center justify-center transition-colors shadow-sm shrink-0 ${deliveryMethod === 'pickup' ? 'bg-blue-600 text-white' : 'bg-gray-50 text-gray-400'}`}>
-                                            <User size={24} />
-                                        </div>
-                                        <div>
-                                            <p className={`font-black text-sm mb-1 ${deliveryMethod === 'pickup' ? 'text-blue-900' : 'text-gray-900'}`}>Ambil Sendiri</p>
-                                            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest leading-tight">Ambil di Kantin</p>
-                                        </div>
-                                    </div>
-
-                                    <div
-                                        onClick={() => setDeliveryMethod('delivery')}
-                                        className={`p-6 rounded-[1.5rem] border-2 transition-all cursor-pointer flex items-center gap-5 ${deliveryMethod === 'delivery' ? 'border-blue-600 bg-blue-50/10' : 'border-gray-100 hover:border-blue-200 bg-white'}`}
-                                    >
-                                        <div className={`w-12 h-12 rounded-xl flex items-center justify-center transition-colors shadow-sm shrink-0 ${deliveryMethod === 'delivery' ? 'bg-blue-600 text-white' : 'bg-gray-50 text-gray-400'}`}>
-                                            <Package size={24} />
-                                        </div>
-                                        <div>
-                                            <p className={`font-black text-sm mb-1 ${deliveryMethod === 'delivery' ? 'text-blue-900' : 'text-gray-900'}`}>Antar ke Kelas</p>
-                                            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest leading-tight">Diantar ke lokasimu</p>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                {deliveryMethod === 'delivery' ? (
-                                    <div className="space-y-3 animate-in fade-in slide-in-from-top-2 duration-300">
-                                        <label className="text-xs font-black text-gray-600 uppercase tracking-widest ml-1">
-                                            Masukkan Nama Kelas/Ruangan <span className="text-red-500">* Wajib diisi</span>
-                                        </label>
-                                        <p className="text-[10px] text-gray-400 font-medium ml-1 -mt-1 italic">
-                                            Sebutkan jurusan dan nomor kelas secara lengkap agar pengirim tidak bingung.
-                                        </p>
-                                        <input
-                                            id="classRoomInput"
-                                            type="text"
-                                            placeholder="Contoh: XII RPL 1 atau Lab Komputer 2"
-                                            className={`w-full p-5 bg-gray-50 border rounded-2xl text-sm font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all ${classError ? 'border-red-500 bg-red-50/20' : 'border-gray-100 focus:border-blue-500'}`}
-                                            value={classRoom}
-                                            onChange={(e) => { setClassRoom(e.target.value); setClassError(false); }}
-                                        />
-                                        {classError && <p className="text-[10px] text-red-500 font-bold uppercase tracking-widest ml-1">Lokasi tujuan tidak boleh kosong</p>}
-                                    </div>
-                                ) : (
-                                    <div className="p-6 bg-blue-50 border border-blue-100 rounded-2xl flex items-start gap-4 animate-in fade-in slide-in-from-top-2 duration-300">
-                                        <Info size={18} className="text-blue-600 mt-0.5 shrink-0" />
-                                        <p className="text-xs text-blue-800 font-bold leading-relaxed">
-                                            Silakan ambil di kantin jika status pesanan sudah <span className="text-blue-600 uppercase">Ready</span>. Tunjukkan struk digitalmu ke petugas.
-                                        </p>
-                                    </div>
-                                )}
-                            </div>
-                        </section>
-
-                        {/* Catatan Pesanan Card */}
-                        <section className="bg-white rounded-[2rem] border border-gray-100 shadow-[0_10px_30px_-15px_rgba(0,0,0,0.05)] overflow-hidden">
-                            <div className="p-8 pb-4">
-                                <h3 className="text-xl font-black text-gray-900 flex items-center gap-4">
-                                    <div className="p-2 bg-blue-50 text-blue-600 rounded-lg">
-                                        <MessageSquare size={22} />
-                                    </div>
-                                    Catatan Pesanan
-                                </h3>
-                            </div>
-                            <div className="p-8 pt-4">
+                            <div className="space-y-4">
+                                <input
+                                    value={customerName}
+                                    onChange={(event) => setCustomerName(event.target.value)}
+                                    placeholder="Nama lengkap pemesan"
+                                    className="w-full rounded-[24px] border border-[rgba(31,35,51,0.08)] bg-[#fffaf2] px-5 py-4 text-sm text-[#1f2333] outline-none placeholder:text-[#8a8f9b] focus:border-[#1f5c57]"
+                                />
                                 <textarea
-                                    placeholder="Contoh: Tanpa seledri, baso dipisah, atau minta mangkuk tambahan..."
-                                    className="w-full h-32 p-6 bg-gray-50 border border-gray-100 rounded-2xl text-sm font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all placeholder:text-gray-400"
                                     value={orderNote}
-                                    onChange={(e) => setOrderNote(e.target.value)}
-                                ></textarea>
-                            </div>
-                        </section>
-
-                        {/* Metode Pembayaran Card */}
-                        <section className="bg-white rounded-[2rem] border border-gray-100 shadow-[0_10px_30px_-15px_rgba(0,0,0,0.05)] overflow-hidden">
-                            <div className="p-8">
-                                <h3 className="text-xl font-black text-gray-900 flex items-center gap-4 mb-8">
-                                    <div className="p-2 bg-blue-50 text-blue-600 rounded-lg">
-                                        <CreditCard size={22} />
-                                    </div>
-                                    Metode Pembayaran
-                                </h3>
-
-                                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                                    {/* Saldo Option */}
-                                    <div
-                                        onClick={() => setPaymentMethod('saldo')}
-                                        className={`p-6 rounded-[1.5rem] border-2 transition-all cursor-pointer group ${paymentMethod === 'saldo' ? 'border-blue-600 bg-blue-50/10' : 'border-gray-100 hover:border-blue-200 bg-white'}`}
-                                    >
-                                        <div className={`w-12 h-12 rounded-xl flex items-center justify-center mb-6 transition-colors ${paymentMethod === 'saldo' ? 'bg-blue-600 text-white shadow-lg' : 'bg-gray-50 text-gray-400 group-hover:bg-blue-50'}`}>
-                                            <Wallet size={24} />
-                                        </div>
-                                        <p className={`font-black text-sm mb-1 ${paymentMethod === 'saldo' ? 'text-blue-900' : 'text-gray-900'}`}>Saldo Siswa</p>
-                                        <p className="text-[10px] font-bold text-blue-600 uppercase tracking-widest">Sisa: Rp 45.000</p>
-                                    </div>
-
-                                    {/* Tunai Option */}
-                                    <div
-                                        onClick={() => setPaymentMethod('tunai')}
-                                        className={`p-6 rounded-[1.5rem] border-2 transition-all cursor-pointer group ${paymentMethod === 'tunai' ? 'border-blue-600 bg-blue-50/10' : 'border-gray-100 hover:border-blue-200 bg-white'}`}
-                                    >
-                                        <div className={`w-12 h-12 rounded-xl flex items-center justify-center mb-6 transition-colors ${paymentMethod === 'tunai' ? 'bg-blue-600 text-white shadow-lg' : 'bg-gray-50 text-gray-400 group-hover:bg-blue-50'}`}>
-                                            <Banknote size={24} />
-                                        </div>
-                                        <p className={`font-black text-sm mb-1 ${paymentMethod === 'tunai' ? 'text-blue-900' : 'text-gray-900'}`}>Tunai di Kantin</p>
-                                        <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Bayar saat ambil</p>
-                                    </div>
-
-                                    {/* QRIS Option */}
-                                    <div
-                                        onClick={() => setPaymentMethod('qris')}
-                                        className={`p-6 rounded-[1.5rem] border-2 transition-all cursor-pointer group ${paymentMethod === 'qris' ? 'border-blue-600 bg-blue-50/10' : 'border-gray-100 hover:border-blue-200 bg-white'}`}
-                                    >
-                                        <div className={`w-12 h-12 rounded-xl flex items-center justify-center mb-6 transition-colors ${paymentMethod === 'qris' ? 'bg-blue-600 text-white shadow-lg' : 'bg-gray-50 text-gray-400 group-hover:bg-blue-50'}`}>
-                                            <QrCode size={24} />
-                                        </div>
-                                        <p className={`font-black text-sm mb-1 ${paymentMethod === 'qris' ? 'text-blue-900' : 'text-gray-900'}`}>QRIS / E-Wallet</p>
-                                        <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest text-[8px]">Gopay, OVO, Dana</p>
-                                    </div>
-                                </div>
-                            </div>
-                        </section>
-                    </div>
-
-                    {/* Right Section (Sticky) */}
-                    <div className="lg:w-[420px] space-y-8">
-                        <div className="bg-white rounded-[2.5rem] border border-gray-100 shadow-[0_20px_50px_-15px_rgba(0,0,0,0.08)] overflow-hidden sticky top-32">
-                            <div className="p-10">
-                                <h3 className="text-2xl font-black text-gray-900 mb-8">Ringkasan Biaya</h3>
-
-                                <div className="space-y-6 mb-10">
-                                    <div className="flex justify-between items-center text-gray-500 font-bold">
-                                        <span className="text-sm">Subtotal Pesanan</span>
-                                        <span className="text-gray-900 text-lg">Rp {formatPrice(subtotal)}</span>
-                                    </div>
-                                    <div className="flex justify-between items-center text-gray-500 font-bold">
-                                        <span className="text-sm">Biaya Layanan</span>
-                                        <span className="text-gray-900">Rp {formatPrice(serviceFee)}</span>
-                                    </div>
-                                    <div className="flex justify-between items-center text-gray-500 font-bold">
-                                        <span className="text-sm">Pajak Resto (0%)</span>
-                                        <span className="text-gray-900">Rp 0</span>
-                                    </div>
-
-                                    <div className="pt-8 border-t border-gray-50 flex items-center justify-between">
-                                        <span className="text-gray-400 font-bold text-sm uppercase tracking-widest">Total Pembayaran</span>
-                                        <span className="text-blue-600 font-black text-3xl tracking-tight">Rp {formatPrice(total)}</span>
-                                    </div>
-                                </div>
-
-                                <div className="mb-6">
-                                    <label className="block text-xs font-bold text-gray-400 uppercase tracking-widest mb-2">Nama Pemesan</label>
-                                    <input 
-                                        type="text" 
-                                        value={namaPembeli} 
-                                        onChange={(e) => setNamaPembeli(e.target.value)} 
-                                        placeholder="Masukkan nama pemesan..."
-                                        className="w-full p-4 bg-gray-50 border border-gray-100 rounded-2xl text-sm font-medium focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all placeholder:text-gray-400"
-                                    />
-                                </div>
-
-                                <button
-                                    onClick={handleConfirmPayment}
-                                    disabled={isProcessing}
-                                    className={`w-full h-16 rounded-2xl font-black text-lg transition-all flex items-center justify-center gap-4 relative overflow-hidden group shadow-2xl ${isProcessing
-                                        ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
-                                        : 'bg-[#1E4DBC] text-white hover:bg-blue-800 shadow-blue-900/40 hover:-translate-y-1 active:scale-95'
-                                        }`}
-                                >
-                                    {isProcessing ? (
-                                        <>
-                                            <div className="w-5 h-5 border-3 border-gray-300 border-t-blue-600 rounded-full animate-spin"></div>
-                                            Memproses...
-                                        </>
-                                    ) : (
-                                        <>
-                                            Pesan Sekarang
-                                            <ChevronRight size={22} className="group-hover:translate-x-1 transition-transform" />
-                                        </>
-                                    )}
-                                </button>
-
-                                <div className="mt-6 flex items-center justify-center gap-2 text-gray-400 font-bold text-[10px] uppercase tracking-widest">
-                                    <ShieldCheck size={14} className="text-gray-300" />
-                                    Transaksi aman & terenkripsi oleh sistem sekolah
-                                </div>
+                                    onChange={(event) => setOrderNote(event.target.value)}
+                                    rows={4}
+                                    placeholder="Catatan pesanan, misalnya saus dipisah atau tanpa tambahan tertentu."
+                                    className="w-full rounded-[24px] border border-[rgba(31,35,51,0.08)] bg-[#fffaf2] px-5 py-4 text-sm text-[#1f2333] outline-none placeholder:text-[#8a8f9b] focus:border-[#1f5c57]"
+                                />
                             </div>
                         </div>
 
-                        {/* Tips Box */}
-                        <div className="p-8 bg-[#EBF0FF] rounded-[2rem] border border-blue-100 flex gap-5">
-                            <div className="w-10 h-10 bg-blue-600 text-white rounded-full flex items-center justify-center shrink-0 shadow-lg shadow-blue-600/30">
-                                <Info size={20} />
+                        <div className="section-card rounded-[34px] p-6 sm:p-8">
+                            <div className="mb-6 flex items-center gap-3">
+                                <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#f3ebdf] text-[#1f5c57]">
+                                    <MapPin size={20} />
+                                </div>
+                                <div>
+                                    <p className="text-xs font-bold uppercase tracking-[0.28em] text-[#6b6f7b]">Pengambilan</p>
+                                    <h2 className="font-display text-3xl text-[#1f2333]">Pilih cara menerima.</h2>
+                                </div>
                             </div>
-                            <div className="space-y-1">
-                                <p className="font-black text-blue-900 text-xs">Tips Kantin:</p>
-                                <p className="text-[10px] text-blue-700 font-bold leading-relaxed uppercase tracking-wider">
-                                    Gunakan Saldo Siswa untuk proses pengambilan pesanan lebih cepat tanpa harus mengantri di kasir.
-                                </p>
+
+                            <div className="grid gap-3 sm:grid-cols-2">
+                                {deliveryOptions.map((option) => (
+                                    <button
+                                        key={option.key}
+                                        onClick={() => setDeliveryMethod(option.key)}
+                                        className={`rounded-[24px] border px-5 py-5 text-left ${deliveryMethod === option.key ? 'border-[#1f5c57] bg-[#eef5f2]' : 'border-[rgba(31,35,51,0.08)] bg-[#fffaf2]'}`}
+                                    >
+                                        <p className="font-display text-2xl text-[#1f2333]">{option.title}</p>
+                                        <p className="mt-2 text-sm leading-7 text-[#5b6170]">{option.note}</p>
+                                    </button>
+                                ))}
                             </div>
+
+                            {deliveryMethod === 'delivery' && (
+                                <textarea
+                                    value={destination}
+                                    onChange={(event) => setDestination(event.target.value)}
+                                    rows={3}
+                                    placeholder="Contoh: XII RPL 1, Lab Komputer 2, atau Ruang Guru."
+                                    className="mt-4 w-full rounded-[24px] border border-[rgba(31,35,51,0.08)] bg-[#fffaf2] px-5 py-4 text-sm text-[#1f2333] outline-none placeholder:text-[#8a8f9b] focus:border-[#1f5c57]"
+                                />
+                            )}
+                        </div>
+
+                        <div className="section-card rounded-[34px] p-6 sm:p-8">
+                            <div className="mb-6 flex items-center gap-3">
+                                <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#f3ebdf] text-[#2d3b73]">
+                                    <CreditCard size={20} />
+                                </div>
+                                <div>
+                                    <p className="text-xs font-bold uppercase tracking-[0.28em] text-[#6b6f7b]">Pembayaran</p>
+                                    <h2 className="font-display text-3xl text-[#1f2333]">Pilih metode bayar.</h2>
+                                </div>
+                            </div>
+
+                            <div className="grid gap-3 sm:grid-cols-2">
+                                {paymentOptions.map((option) => (
+                                    <button
+                                        key={option.key}
+                                        onClick={() => setPaymentMethod(option.key)}
+                                        className={`rounded-[24px] border px-4 py-5 text-left ${paymentMethod === option.key ? 'border-[#2d3b73] bg-[#eef1fb]' : 'border-[rgba(31,35,51,0.08)] bg-[#fffaf2]'}`}
+                                    >
+                                        <p className="font-display text-2xl text-[#1f2333]">{option.title}</p>
+                                        <p className="mt-2 text-sm leading-7 text-[#5b6170]">{option.note}</p>
+                                    </button>
+                                ))}
+                            </div>
+
+                            {paymentMethod === 'midtrans' ? (
+                                <div className="mt-4 rounded-[24px] border border-[rgba(45,59,115,0.12)] bg-[#eef1fb] px-5 py-4 text-sm leading-7 text-[#45507a]">
+                                    Midtrans akan membuka popup Snap untuk QRIS, GoPay, ShopeePay, virtual account, dan kartu. Cocok untuk presentasi karena alurnya lebih realistis.
+                                </div>
+                            ) : null}
                         </div>
                     </div>
-                </div>
-            </div>
 
-            {/* Simple Footer Ref */}
-            <div className="mt-20 py-10 border-t border-gray-50 text-center flex flex-col items-center gap-6">
-                <div className="flex items-center gap-6">
-                    <div className="w-4 h-4 text-gray-300"><ShoppingCart size={16} /></div>
-                    <span className="text-xs font-bold text-gray-400">© 2024 E-Baso Kantin Sekolah. Semua Hak Dilindungi.</span>
-                </div>
-                <div className="flex items-center gap-6 text-gray-300">
-                    <Info size={20} className="hover:text-blue-600 cursor-pointer" />
-                    <ShoppingBag size={20} className="hover:text-blue-600 cursor-pointer" />
-                    <CreditCard size={20} className="hover:text-blue-600 cursor-pointer" />
-                </div>
-            </div>
+                    <aside className="section-card rounded-[34px] p-6 sm:p-8 xl:sticky xl:top-32 xl:h-fit">
+                        <p className="text-xs font-bold uppercase tracking-[0.28em] text-[#6b6f7b]">Ringkasan belanja</p>
+                        <h2 className="font-display mt-2 text-4xl text-[#1f2333]">Yang akan kamu bayar.</h2>
+
+                        <div className="mt-8 space-y-4">
+                            {cartItems.map((item, index) => (
+                                <div key={`${item.id}-${index}`} className="flex items-center gap-4 rounded-[24px] bg-[#fffaf2] p-4">
+                                    <div className="relative h-16 w-16 overflow-hidden rounded-2xl">
+                                        <Image
+                                            src={item.image}
+                                            alt={item.name}
+                                            fill
+                                            sizes="64px"
+                                            className="object-cover"
+                                        />
+                                    </div>
+                                    <div className="flex-1">
+                                        <p className="font-semibold text-[#1f2333]">{item.name}</p>
+                                        <p className="text-xs uppercase tracking-[0.22em] text-[#6b6f7b]">{item.quantity} porsi</p>
+                                    </div>
+                                    <p className="font-semibold text-[#1f2333]">Rp {formatCurrency(item.price * item.quantity)}</p>
+                                </div>
+                            ))}
+                        </div>
+
+                        <div className="mt-8 space-y-4 border-t border-[rgba(31,35,51,0.08)] pt-6 text-sm">
+                            <div className="flex items-center justify-between text-[#5b6170]">
+                                <span>Subtotal</span>
+                                <span className="font-semibold text-[#1f2333]">Rp {formatCurrency(subtotal)}</span>
+                            </div>
+                            <div className="flex items-center justify-between text-[#5b6170]">
+                                <span>Biaya layanan</span>
+                                <span className="font-semibold text-[#1f2333]">Rp {formatCurrency(serviceFee)}</span>
+                            </div>
+                            <div className="flex items-center justify-between border-t border-[rgba(31,35,51,0.08)] pt-4">
+                                <span className="font-semibold text-[#1f2333]">Total bayar</span>
+                                <span className="font-display text-4xl text-[#d66b43]">Rp {formatCurrency(total)}</span>
+                            </div>
+                        </div>
+
+                        {checkoutError ? (
+                            <div className="mt-6 rounded-[22px] border border-[rgba(214,107,67,0.18)] bg-[#fff1eb] px-4 py-3 text-sm leading-7 text-[#a04c2f]">
+                                {checkoutError}
+                            </div>
+                        ) : null}
+
+                        <button
+                            onClick={handleSubmit}
+                            disabled={isSubmitting}
+                            className="mt-8 w-full rounded-full bg-[#1f2333] px-5 py-4 text-sm font-semibold text-white shadow-[0_16px_30px_rgba(31,35,51,0.18)] transition hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-70"
+                        >
+                            {isSubmitting
+                                ? 'Memproses Checkout...'
+                                : paymentMethod === 'midtrans'
+                                    ? (pendingMidtransPayment?.token ? 'Lanjutkan Pembayaran Midtrans' : 'Bayar dengan Midtrans')
+                                    : 'Konfirmasi Pesanan'}
+                        </button>
+                    </aside>
+                </section>
+            </main>
+
+            <SiteFooter />
         </div>
     );
 }

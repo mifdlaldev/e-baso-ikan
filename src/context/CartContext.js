@@ -1,123 +1,122 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
+import {
+    getProductImage,
+    normalizeCartItem,
+    normalizeCartItems,
+    normalizeOrders,
+    normalizeProduct,
+    normalizeProducts
+} from '../lib/productImages';
+import { MENU_PRODUCTS } from '../lib/productCatalog';
+import { getSupabaseBrowserClient } from '../lib/supabase/client';
+import {
+    buildOrderInsertPayload,
+    mapDbProductToApp,
+    mapReportInsertPayload
+} from '../lib/supabase/mappers';
+import { useAuth } from './AuthContext';
 
 const CartContext = createContext();
 
-const DEFAULT_PRODUCTS = [
-    {
-        id: 1,
-        name: 'Baso Ikan',
-        description: 'Baso ikan goreng renyah disajikan dengan saus manis atau pedas.',
-        price: 15000,
-        category: 'Gorengan',
-        image: '/images/animasi-baso-ikan.png',
-        popular: true,
-        available: true
-    },
-    {
-        id: 2,
-        name: 'Baso Cumi',
-        description: 'Baso cumi premium, lebih besar dan lebih enak. Cocok untuk cemilan.',
-        price: 20000,
-        category: 'Gorengan',
-        image: 'https://placehold.co/400x300/e2e8f0/1e40af?text=Baso+Cumi',
-        popular: false,
-        available: true
-    },
-    {
-        id: 3,
-        name: 'Kikiam',
-        description: 'Kikiam ayam dan sayuran otentik yang digoreng sempurna.',
-        price: 15000,
-        category: 'Gorengan',
-        image: 'https://placehold.co/400x300/e2e8f0/1e40af?text=Kikiam',
-        popular: true,
-        available: true
-    },
-    {
-        id: 4,
-        name: 'Es Gulaman',
-        description: 'Minuman jelly manis yang menyegarkan dengan es. Pelepas dahaga yang sempurna.',
-        price: 10000,
-        category: 'Minuman',
-        image: 'https://placehold.co/400x300/e2e8f0/1e40af?text=Gulaman',
-        popular: false,
-        available: true
-    },
-    {
-        id: 5,
-        name: 'Siomay Babi',
-        description: '4pcs siomay babi kukus dengan saus kecap calamansi.',
-        price: 25000,
-        category: 'Kukus',
-        image: 'https://placehold.co/400x300/e2e8f0/1e40af?text=Siomay',
-        popular: false,
-        available: true
-    },
-    {
-        id: 6,
-        name: 'Sosis Goreng',
-        description: 'Sosis merah juicy digoreng dan disajikan dengan tusuk sate.',
-        price: 18000,
-        category: 'Gorengan',
-        image: 'https://placehold.co/400x300/e2e8f0/1e40af?text=Sosis',
-        popular: true,
-        available: true
-    },
-    {
-        id: 7,
-        name: 'Paket Spesial Kombo',
-        description: 'Baso Ikan + Kikiam + Minuman',
-        price: 45000,
-        category: 'Paket',
-        image: '/images/',
-        popular: false,
-        available: true
-    },
-    {
-        id: 8,
-        name: 'Paket Trio Baso Ikan Pedas',
-        description: 'Jajanan favorit klasik disajikan dengan cuka manis & pedas khas kami. Cocok untuk dinikmati ramai-ramai.',
-        price: 25000,
-        category: 'Paket',
-        image: '/images/',
-        popular: true,
-        available: true
-    }
-];
+function isMidtransEnumError(error) {
+    return Boolean(
+        error?.code === '22P02' &&
+        /invalid input value for enum payment_method/i.test(error.message || '')
+    );
+}
+
+const getStoredValue = (key, fallbackValue, normalizer = (value) => value) => {
+    if (typeof window === 'undefined') return fallbackValue;
+
+    const storedValue = window.localStorage.getItem(key);
+    if (!storedValue) return fallbackValue;
+
+    return normalizer(JSON.parse(storedValue));
+};
+
+const DEFAULT_PRODUCTS = MENU_PRODUCTS.map((product) => ({
+    ...product,
+    image: getProductImage(product)
+}));
+
+const mergeStoredProducts = (storedProducts = []) => (
+    Array.isArray(storedProducts) && storedProducts.length > 0
+        ? normalizeProducts(storedProducts)
+        : normalizeProducts(DEFAULT_PRODUCTS)
+);
 
 export function CartProvider({ children }) {
-    const [cartItems, setCartItems] = useState([]);
-    const [products, setProducts] = useState(DEFAULT_PRODUCTS);
-    const [orders, setOrders] = useState([]);
-    const [reports, setReports] = useState([]);
+    const { user } = useAuth();
+    const [cartItems, setCartItems] = useState(() => getStoredValue('ebaso_cart', [], normalizeCartItems));
+    const [products, setProducts] = useState(() => getStoredValue('ebaso_products', DEFAULT_PRODUCTS, mergeStoredProducts));
+    const [orders, setOrders] = useState(() => getStoredValue('ebaso_orders', [], normalizeOrders));
+    const [reports, setReports] = useState(() => getStoredValue('ebaso_reports', []));
 
-    // Load data from localStorage on mount
     useEffect(() => {
-        const savedCart = localStorage.getItem('ebaso_cart');
-        if (savedCart) setCartItems(JSON.parse(savedCart));
+        const loadProductsFromSupabase = async () => {
+            const supabase = getSupabaseBrowserClient();
+            if (!supabase) return;
 
-        const savedProducts = localStorage.getItem('ebaso_products');
-        if (savedProducts) setProducts(JSON.parse(savedProducts));
-        else localStorage.setItem('ebaso_products', JSON.stringify(DEFAULT_PRODUCTS));
+            const { data, error } = await supabase
+                .from('products')
+                .select(`
+                    id,
+                    slug,
+                    name,
+                    short_name,
+                    description,
+                    long_description,
+                    category,
+                    price,
+                    image_url,
+                    is_featured,
+                    is_available,
+                    accent_gradient,
+                    calories_label,
+                    prep_time_label,
+                    freshness_label,
+                    serving_note,
+                    sort_order,
+                    product_addons (
+                        code,
+                        label,
+                        price,
+                        is_active,
+                        sort_order
+                    )
+                `)
+                .order('sort_order', { ascending: true });
 
-        const savedOrders = localStorage.getItem('ebaso_orders');
-        if (savedOrders) setOrders(JSON.parse(savedOrders));
+            if (error || !data) {
+                console.warn('Failed to load Supabase products:', error?.message);
+                return;
+            }
 
-        const savedReports = localStorage.getItem('ebaso_reports');
-        if (savedReports) setReports(JSON.parse(savedReports));
+            const remoteProducts = data.map((productRow) => mapDbProductToApp(productRow));
+            const normalizedRemoteProducts = normalizeProducts(remoteProducts);
+            setProducts(normalizedRemoteProducts);
+            localStorage.setItem('ebaso_products', JSON.stringify(normalizedRemoteProducts));
+        };
 
+        loadProductsFromSupabase();
+    }, []);
+
+    useEffect(() => {
         // Listener for storage changes (auto-sync between tabs)
         const handleStorageChange = (e) => {
             if (e.key === 'ebaso_orders') {
-                setOrders(JSON.parse(e.newValue || '[]'));
+                setOrders(normalizeOrders(JSON.parse(e.newValue || '[]')));
             }
             if (e.key === 'ebaso_products') {
-                setProducts(JSON.parse(e.newValue || '[]'));
+                setProducts(mergeStoredProducts(JSON.parse(e.newValue || '[]')));
             }
             if (e.key === 'ebaso_reports') {
                 setReports(JSON.parse(e.newValue || '[]'));
+            }
+            if (e.key === 'ebaso_cart') {
+                setCartItems(normalizeCartItems(JSON.parse(e.newValue || '[]')));
             }
         };
 
@@ -143,9 +142,11 @@ export function CartProvider({ children }) {
     }, [reports]);
 
     const addToCart = (product, quantity = 1, extras = {}) => {
+        const normalizedProduct = normalizeCartItem(product);
+
         setCartItems(prevItems => {
             const existingItemIndex = prevItems.findIndex(item =>
-                item.id === product.id &&
+                item.id === normalizedProduct.id &&
                 JSON.stringify(item.extras) === JSON.stringify(extras)
             );
 
@@ -154,7 +155,7 @@ export function CartProvider({ children }) {
                 newItems[existingItemIndex].quantity += quantity;
                 return newItems;
             } else {
-                return [...prevItems, { ...product, product_id: product.id, quantity, extras }];
+                return [...prevItems, { ...normalizedProduct, product_id: normalizedProduct.id, quantity, extras }];
             }
         });
     };
@@ -182,14 +183,19 @@ export function CartProvider({ children }) {
         setCartItems([]);
     };
 
-    const checkout = (metadata = {}) => {
+    const checkout = async (metadata = {}, options = {}) => {
         if (cartItems.length === 0) return;
+
+        const serviceFee = cartItems.length > 0 ? 2000 : 0;
+        const subtotal = cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+        const shouldClearCart = options.clearCart !== false;
 
         const newOrder = {
             id: `#ORD-${Date.now()}`,
             date: new Date().toLocaleString('id-ID'),
             items: [...cartItems],
-            total: cartItems.reduce((sum, item) => sum + (item.price * item.quantity), 0),
+            total: subtotal + serviceFee,
+            serviceFee,
             status: 'Menunggu',
             timestamp: Date.now(),
             ...metadata
@@ -198,8 +204,73 @@ export function CartProvider({ children }) {
         const updatedOrders = [newOrder, ...orders];
         setOrders(updatedOrders);
         localStorage.setItem('ebaso_orders', JSON.stringify(updatedOrders)); // Force update for event
-        clearCart();
-        return newOrder.id;
+
+        const supabase = getSupabaseBrowserClient();
+        let insertedOrderId = null;
+
+        if (supabase) {
+            const payload = buildOrderInsertPayload({
+                cartItems,
+                metadata: {
+                    ...metadata,
+                    profileId: user?.id ?? null
+                }
+            });
+            let { data: insertedOrder, error: orderError } = await supabase
+                .from('orders')
+                .insert(payload.order)
+                .select('id, order_code')
+                .single();
+
+            if (orderError && metadata.paymentMethod === 'midtrans' && isMidtransEnumError(orderError)) {
+                console.warn('Midtrans enum belum aktif di database, fallback insert order memakai payment_method tunai.');
+
+                const fallbackResult = await supabase
+                    .from('orders')
+                    .insert({
+                        ...payload.order,
+                        payment_method: 'tunai'
+                    })
+                    .select('id, order_code')
+                    .single();
+
+                insertedOrder = fallbackResult.data;
+                orderError = fallbackResult.error;
+            }
+
+            if (orderError) {
+                console.warn('Failed to insert order into Supabase:', orderError.message);
+            } else if (insertedOrder?.id) {
+                insertedOrderId = insertedOrder.id;
+                const { error: itemError } = await supabase
+                    .from('order_items')
+                    .insert(payload.items.map((item) => ({
+                        ...item,
+                        order_id: insertedOrder.id
+                    })));
+
+                if (itemError) {
+                    console.warn('Failed to insert order items into Supabase:', itemError.message);
+                } else if (insertedOrder.order_code) {
+                    newOrder.id = insertedOrder.order_code;
+                    const syncedOrders = [{ ...newOrder }, ...orders];
+                    setOrders(syncedOrders);
+                    localStorage.setItem('ebaso_orders', JSON.stringify(syncedOrders));
+                }
+            }
+        }
+
+        if (shouldClearCart) {
+            clearCart();
+        }
+
+        return {
+            orderId: newOrder.id,
+            total: newOrder.total,
+            serviceFee,
+            subtotal,
+            supabaseOrderId: insertedOrderId
+        };
     };
 
     // Admin Helpers
@@ -212,22 +283,25 @@ export function CartProvider({ children }) {
     };
 
     const addProduct = (product) => {
-        setProducts(prev => [...prev, { ...product, id: Date.now(), available: true }]);
+        setProducts(prev => [...prev, normalizeProduct({ ...product, id: Date.now(), available: true })]);
     };
 
     const updateProduct = (productId, updatedProduct) => {
-        setProducts(prev => prev.map(p => p.id === productId ? { ...p, ...updatedProduct } : p));
+        setProducts(prev => prev.map(p => (
+            p.id === productId ? normalizeProduct({ ...p, ...updatedProduct }) : p
+        )));
     };
 
     const deleteProduct = (productId) => {
         setProducts(prev => prev.filter(p => p.id !== productId));
     };
 
-    const addReport = (newReport) => {
+    const addReport = async (newReport) => {
         const reportWithMeta = {
             id: Date.now(),
             status: 'Baru',
             timestamp: new Date(),
+            profile_id: user?.id ?? null,
             ...newReport
         };
         setReports(prev => {
@@ -235,7 +309,17 @@ export function CartProvider({ children }) {
             localStorage.setItem('ebaso_reports', JSON.stringify(updated));
             return updated;
         });
-        console.log('Report added in Context:', reportWithMeta);
+
+        const supabase = getSupabaseBrowserClient();
+        if (supabase) {
+            const { error } = await supabase
+                .from('feedback_reports')
+                .insert(mapReportInsertPayload(reportWithMeta));
+
+            if (error) {
+                console.warn('Failed to insert feedback report into Supabase:', error.message);
+            }
+        }
     };
 
     const updateReportStatus = (reportId, newStatus) => {
@@ -244,7 +328,6 @@ export function CartProvider({ children }) {
             localStorage.setItem('ebaso_reports', JSON.stringify(updated));
             return updated;
         });
-        console.log(`Report ${reportId} status updated to:`, newStatus);
     };
 
     const deleteReport = (reportId) => {
